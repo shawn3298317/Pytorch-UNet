@@ -7,78 +7,103 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from tensorboardX import SummaryWriter
 
 from eval import eval_net
 from unet import UNet
-from utils import get_ids, split_train_val, get_imgs_and_masks, batch
+from utils.modanet_dataset import ModanetDataset
 
-dir_img = 'data/imgs/'
-dir_mask = 'data/masks/'
-dir_checkpoint = 'checkpoints/'
-
+dir_checkpoint = "./ckpt/"
 
 def train_net(net,
               device,
               epochs=5,
               batch_size=1,
-              lr=0.1,
-              val_percent=0.15,
+              lr=0.001,
               save_cp=True,
-              img_scale=0.5):
-    ids = get_ids(dir_img)
+              img_scale=0.5,
+              writer=None):
 
-    iddataset = split_train_val(ids, val_percent)
+    train_dataset = ModanetDataset("/projectnb/cs542/shawnlin/image-segmentation/paperdoll/data/chictopia/photos.lmdb",
+                                   "/projectnb/cs542/shawnlin/image-segmentation/modanet/annotations/modanet2018_instances_train.json",
+                                   400, False)
+    dev_dataset = ModanetDataset("/projectnb/cs542/shawnlin/image-segmentation/paperdoll/data/chictopia/photos.lmdb",
+                                 "/projectnb/cs542/shawnlin/image-segmentation/modanet/annotations/modanet2018_instances_dev.json",
+                                 400, False)
+
+
+    n_train = len(train_dataset)
+    n_val = len(dev_dataset)
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
         Batch size:      {batch_size}
         Learning rate:   {lr}
-        Training size:   {len(iddataset["train"])}
-        Validation size: {len(iddataset["val"])}
+        Training size:   {n_train}
+        Validation size: {n_val}
         Checkpoints:     {save_cp}
         Device:          {device.type}
         Images scaling:  {img_scale}
     ''')
 
-    n_train = len(iddataset['train'])
-    n_val = len(iddataset['val'])
+
+    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+    dev_loader = DataLoader(dataset=dev_dataset, batch_size=1, shuffle=True, num_workers=4)
+
     optimizer = optim.Adam(net.parameters(), lr=lr)
     if net.n_classes > 1:
         criterion = nn.CrossEntropyLoss()
     else:
         criterion = nn.BCEWithLogitsLoss()
 
+    """
+    img_enc = None
+    if use_pretrain_cnn == "resnet":
+        img_enc = models.resnet18(pretrained=True)
+        modules = list(img_enc.children())[:-2]
+        img_enc = nn.Sequential(*modules)
+        for params in img_enc.parameters():
+            params.requires_grad = False
+            img_enc = img_enc.cuda()
+        img_enc.eval()
+    """
     for epoch in range(epochs):
         net.train()
 
-        # reset the generators
-        train = get_imgs_and_masks(iddataset['train'], dir_img, dir_mask, img_scale)
-        val = get_imgs_and_masks(iddataset['val'], dir_img, dir_mask, img_scale)
-
         epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img') as pbar:
-            for i, b in enumerate(batch(train, batch_size)):
-                imgs = np.array([i[0] for i in b]).astype(np.float32)
-                true_masks = np.array([i[1] for i in b])
 
-                imgs = torch.from_numpy(imgs)
-                true_masks = torch.from_numpy(true_masks)
+        for batch_idx, batch in enumerate(tqdm(train_loader)):
+            #if batch_idx > 50:
+            #    break
 
-                imgs = imgs.to(device=device)
-                true_masks = true_masks.to(device=device)
+            if batch is None:
+                continue
 
-                masks_pred = net(imgs)
-                loss = criterion(masks_pred, true_masks)
-                epoch_loss += loss.item()
+            img_batch, mask_batch = batch
+            img_batch = img_batch.to(device)
+            mask_batch = mask_batch.to(device)
 
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            optimizer.zero_grad()
+            masks_pred = net(img_batch)
 
-                pbar.update(batch_size)
+            #print("mask shape", mask_batch.shape)
+            #print("mask_pred shape", masks_pred.shape)
+            loss = criterion(masks_pred, mask_batch)
+            epoch_loss += loss.item()
+
+            loss.backward()
+            optimizer.step()
+
+            if writer is not None:
+                train_step = epoch*len(train_loader) + (batch_idx + 1)
+                writer.add_scalar('train/loss', loss.data, train_step)
+                if train_step % 10 == 0:
+                    writer.flush()
+
+            print("Train Epoch: %i, batch: %i, Loss: %.6f" % (epoch, batch_idx, loss.data))
 
         if save_cp:
             try:
@@ -86,11 +111,13 @@ def train_net(net,
                 logging.info('Created checkpoint directory')
             except OSError:
                 pass
-            torch.save(net.state_dict(),
-                       dir_checkpoint + f'CP_epoch{epoch + 1}.pth')
+            torch.save(net.state_dict(), dir_checkpoint + f'CP_epoch{epoch + 1}.pth')
             logging.info(f'Checkpoint {epoch + 1} saved !')
 
-        val_score = eval_net(net, val, device, n_val)
+        val_score = eval_net(net, dev_loader, device)
+        if writer is not None:
+            writer.add_scalar("val/loss", val_score, epoch)
+
         if net.n_classes > 1:
             logging.info('Validation cross entropy: {}'.format(val_score))
 
@@ -101,11 +128,11 @@ def train_net(net,
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=5,
+    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=10,
                         help='Number of epochs', dest='epochs')
-    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=1,
+    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=4,
                         help='Batch size', dest='batchsize')
-    parser.add_argument('-l', '--learning-rate', metavar='LR', type=float, nargs='?', default=0.1,
+    parser.add_argument('-l', '--learning-rate', metavar='LR', type=float, nargs='?', default=0.001,
                         help='Learning rate', dest='lr')
     parser.add_argument('-f', '--load', dest='load', type=str, default=False,
                         help='Load model from a .pth file')
@@ -118,11 +145,10 @@ def get_args():
 
 
 def pretrain_checks():
-    imgs = [f for f in os.listdir(dir_img) if not f.startswith('.')]
-    masks = [f for f in os.listdir(dir_mask) if not f.startswith('.')]
-    if len(imgs) != len(masks):
-        logging.warning(f'The number of images and masks do not match ! '
-                        f'{len(imgs)} images and {len(masks)} masks detected in the data folder.')
+    pass
+    #if len(imgs) != len(masks):
+    #    logging.warning(f'The number of images and masks do not match ! '
+    #                    f'{len(imgs)} images and {len(masks)} masks detected in the data folder.')
 
 
 if __name__ == '__main__':
@@ -138,34 +164,33 @@ if __name__ == '__main__':
     #   - For 1 class and background, use n_classes=1
     #   - For 2 classes, use n_classes=1
     #   - For N > 2 classes, use n_classes=N
-    net = UNet(n_channels=3, n_classes=1)
+    net = UNet(n_channels=3, n_classes=14)
     logging.info(f'Network:\n'
                  f'\t{net.n_channels} input channels\n'
                  f'\t{net.n_classes} output channels (classes)\n'
                  f'\t{"Bilinear" if net.bilinear else "Dilated conv"} upscaling')
 
     if args.load:
-        net.load_state_dict(
-            torch.load(args.load, map_location=device)
-        )
+        net.load_state_dict(torch.load(args.load, map_location=device))
         logging.info(f'Model loaded from {args.load}')
 
     net.to(device=device)
     # faster convolutions, but more memory
     # cudnn.benchmark = True
 
-try:
-    train_net(net=net,
-              epochs=args.epochs,
-              batch_size=args.batchsize,
-              lr=args.lr,
-              device=device,
-              img_scale=args.scale,
-              val_percent=args.val / 100)
-except KeyboardInterrupt:
-    torch.save(net.state_dict(), 'INTERRUPTED.pth')
-    logging.info('Saved interrupt')
     try:
-        sys.exit(0)
-    except SystemExit:
-        os._exit(0)
+        writer = SummaryWriter()
+        train_net(net=net,
+                  epochs=args.epochs,
+                  batch_size=args.batchsize,
+                  lr=args.lr,
+                  device=device,
+                  img_scale=args.scale,
+                  writer=writer)
+    except KeyboardInterrupt:
+        torch.save(net.state_dict(), 'INTERRUPTED.pth')
+        logging.info('Saved interrupt')
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
