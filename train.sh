@@ -1,2 +1,2 @@
-python train.py -b 16\
+python train.py -b 8\
                 -e 15\

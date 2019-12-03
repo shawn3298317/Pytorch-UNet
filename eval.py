@@ -23,14 +23,14 @@ def eval_net(net, dev_loader, device):
             #mask_pred =
             #mask_pred = (mask_pred > 0.5).float()
 
-            if batch_idx % 249 == 1:
-                img = img_batch.data.cpu().numpy()[0]
-                img = np.swapaxes(img, 0, 2)
-                pred = mask_pred[0].data.cpu().numpy()[0]
-                print("imgshape", img.shape)
-                print("predshape", pred.shape)
-                scipy.misc.imsave('eval_%i.img.jpg' % batch_idx, img)
-                scipy.misc.imsave('eval_%i.predict.jpg' % batch_idx, pred)
+            #if batch_idx % 249 == 1:
+            #    img = img_batch.data.cpu().numpy()[0]
+            #    img = np.swapaxes(img, 0, 2)
+            #    pred = mask_pred[0].data.cpu().numpy()[0]
+            #    print("imgshape", img.shape)
+            #    print("predshape", pred.shape)
+            #    scipy.misc.imsave('eval_%i.img.jpg' % batch_idx, img)
+            #    scipy.misc.imsave('eval_%i.predict.jpg' % batch_idx, pred)
 
             if net.n_classes > 1:
                 tot += F.cross_entropy(mask_pred, mask_batch).item()
